@@ -1,269 +1,446 @@
+import io
 import os
-import json
-import base64
 import logging
 import zipfile
-from io import BytesIO
+from typing import Optional
 
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, UploadFile, File
+from fastapi.responses import JSONResponse
 from pptx import Presentation
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("rtsm-ppt-extractor")
+
+# ============================================================
+# APPLICATION SETUP
+# ============================================================
 
 app = FastAPI(
-    title="RTSM PPTX Text Extractor",
+    title="Tata RTSM PPT Extractor",
     version="2.0"
 )
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+
+logger = logging.getLogger("rtm-ppt-extractor")
+
+
+# ============================================================
+# HEALTH CHECK
+# ============================================================
 
 @app.get("/")
-def home():
+async def health_check():
     return {
-        "status": "online",
-        "service": "RTSM PPTX Extractor",
-        "endpoint": "/extract",
-        "version": "2.0"
+        "status": "ok",
+        "service": "tata-rtsm-ppt-extractor",
+        "version": "2.0",
+        "message": "Your service is live 🎉"
     }
 
 
-def is_valid_pptx(data: bytes) -> bool:
-    """Check that bytes look like a real PPTX ZIP package."""
-    if not data or not data.startswith(b"PK"):
-        return False
+# ============================================================
+# BASIC PPTX VALIDATION
+# ============================================================
 
-    try:
-        with zipfile.ZipFile(BytesIO(data)) as z:
-            names = set(z.namelist())
-            return "[Content_Types].xml" in names and any(
-                n.startswith("ppt/") for n in names
-            )
-    except Exception:
-        return False
+def validate_pptx(data: bytes):
 
-
-def decode_base64_candidate(value):
-    """Decode a base64 candidate only when it produces a valid PPTX."""
-    if not isinstance(value, str):
-        return None
-
-    value = value.strip()
-
-    # Remove a possible data URL prefix.
-    if value.startswith("data:") and "," in value:
-        value = value.split(",", 1)[1]
-
-    # Remove whitespace/newlines commonly present in base64.
-    value = "".join(value.split())
-
-    if not value:
-        return None
-
-    try:
-        decoded = base64.b64decode(value, validate=False)
-    except Exception:
-        return None
-
-    if is_valid_pptx(decoded):
-        return decoded
-
-    return None
-
-
-def find_pptx_in_json(obj):
-    """
-    Power Automate can wrap file content inside JSON, commonly using
-    $content / $contentBytes / contentBytes. Search recursively so the
-    endpoint remains tolerant of different HTTP body shapes.
-    """
-    if isinstance(obj, dict):
-        preferred_keys = [
-            "$content",
-            "$contentBytes",
-            "contentBytes",
-            "fileContent",
-            "file_content",
-            "content",
-            "body",
-        ]
-
-        for key in preferred_keys:
-            if key in obj:
-                found = find_pptx_in_json(obj[key])
-                if found:
-                    return found
-
-        for value in obj.values():
-            found = find_pptx_in_json(value)
-            if found:
-                return found
-
-    elif isinstance(obj, list):
-        for item in obj:
-            found = find_pptx_in_json(item)
-            if found:
-                return found
-
-    elif isinstance(obj, str):
-        return decode_base64_candidate(obj)
-
-    return None
-
-
-def extract_file_bytes(raw_body: bytes, content_type: str) -> bytes:
-    """
-    Accept all common Power Automate HTTP body forms:
-    1. Raw PPTX binary
-    2. Base64 text
-    3. JSON containing base64 file content
-    4. Multipart/form-data containing a PPTX
-    """
-    if is_valid_pptx(raw_body):
-        return raw_body
-
-    # If multipart/form-data or another wrapper contains the ZIP payload,
-    # locate the PPTX ZIP header and validate the candidate.
-    zip_start = raw_body.find(b"PK\x03\x04")
-    if zip_start > 0:
-        candidate = raw_body[zip_start:]
-        if is_valid_pptx(candidate):
-            return candidate
-
-    # JSON body from Power Automate.
-    try:
-        text = raw_body.decode("utf-8")
-        parsed = json.loads(text)
-        found = find_pptx_in_json(parsed)
-        if found:
-            return found
-
-        # JSON may simply be a quoted base64 string.
-        found = decode_base64_candidate(parsed) if isinstance(parsed, str) else None
-        if found:
-            return found
-    except Exception:
-        pass
-
-    # Plain base64 body.
-    found = decode_base64_candidate(raw_body.decode("utf-8", errors="ignore"))
-    if found:
-        return found
-
-    raise HTTPException(
-        status_code=400,
-        detail={
-            "error": "Invalid PPTX payload",
-            "message": "The /extract endpoint received data, but it could not find a valid PPTX file.",
-            "content_type": content_type,
-            "received_bytes": len(raw_body),
-            "first_bytes": raw_body[:20].hex()
-        }
-    )
-
-
-def extract_slide_content(prs):
-    slides = []
-
-    for slide_number, slide in enumerate(prs.slides, start=1):
-        slide_lines = []
-
-        for shape in slide.shapes:
-            # Text boxes, titles and placeholders
-            if getattr(shape, "has_text_frame", False):
-                text = shape.text.strip()
-                if text:
-                    slide_lines.append(text)
-
-            # Tables
-            if getattr(shape, "has_table", False):
-                table_lines = []
-
-                for row in shape.table.rows:
-                    cells = []
-                    for cell in row.cells:
-                        cells.append(cell.text.strip())
-
-                    if any(cells):
-                        table_lines.append(" | ".join(cells))
-
-                if table_lines:
-                    slide_lines.append("[TABLE]")
-                    slide_lines.extend(table_lines)
-
-        slides.append({
-            "slide": slide_number,
-            "text": "\n".join(slide_lines)
-        })
-
-    return slides
-
-
-@app.post("/extract")
-async def extract_pptx(request: Request):
-    content_type = request.headers.get("content-type", "")
-    raw_body = await request.body()
+    if not data:
+        raise ValueError("Request body is empty.")
 
     logger.info(
-        "POST /extract received: content_type=%s bytes=%d first_bytes=%s",
-        content_type,
-        len(raw_body),
-        raw_body[:20].hex()
+        "Received file size: %d bytes",
+        len(data)
     )
 
-    if not raw_body:
-        raise HTTPException(
-            status_code=400,
-            detail="No file content received in request body."
+    # PPTX is a ZIP container and normally starts with PK
+    if not data.startswith(b"PK"):
+        logger.warning(
+            "File does not start with PK ZIP signature. First 16 bytes: %s",
+            data[:16].hex()
+        )
+
+        raise ValueError(
+            "Uploaded file is not a valid PPTX ZIP package."
         )
 
     try:
-        file_data = extract_file_bytes(raw_body, content_type)
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            bad_file = z.testzip()
 
-        logger.info(
-            "PPTX payload decoded successfully: %d bytes",
-            len(file_data)
+            if bad_file:
+                raise ValueError(
+                    f"PPTX ZIP package is corrupted: {bad_file}"
+                )
+
+            names = z.namelist()
+
+            if "[Content_Types].xml" not in names:
+                raise ValueError(
+                    "Invalid Office file: [Content_Types].xml missing."
+                )
+
+            if not any(
+                name.startswith("ppt/")
+                for name in names
+            ):
+                raise ValueError(
+                    "Invalid PPTX: ppt/ directory not found."
+                )
+
+    except zipfile.BadZipFile:
+        raise ValueError(
+            "The uploaded file is not a valid ZIP/PPTX file."
         )
 
-        prs = Presentation(BytesIO(file_data))
-        slides = extract_slide_content(prs)
 
-        logger.info(
-            "PPTX extraction successful: slides=%d",
-            len(slides)
+# ============================================================
+# TEXT EXTRACTION
+# ============================================================
+
+def extract_shape_text(shape):
+
+    result = []
+
+    # Normal text box / title / placeholder
+    if hasattr(shape, "text"):
+
+        text = shape.text.strip()
+
+        if text:
+            result.append(text)
+
+    # Tables
+    if getattr(shape, "has_table", False):
+
+        table_data = []
+
+        for row in shape.table.rows:
+
+            row_data = []
+
+            for cell in row.cells:
+
+                cell_text = cell.text.strip()
+
+                row_data.append(cell_text)
+
+            table_data.append(row_data)
+
+        if table_data:
+
+            result.append(
+                "\n".join(
+                    " | ".join(row)
+                    for row in table_data
+                )
+            )
+
+    return result
+
+
+# ============================================================
+# PPTX EXTRACTION
+# ============================================================
+
+def extract_presentation(data: bytes):
+
+    prs = Presentation(io.BytesIO(data))
+
+    slides_output = []
+
+    total_characters = 0
+
+    for slide_number, slide in enumerate(
+        prs.slides,
+        start=1
+    ):
+
+        slide_text_parts = []
+
+        title = ""
+
+        # ----------------------------------------------------
+        # Find title
+        # ----------------------------------------------------
+
+        for shape in slide.shapes:
+
+            if not hasattr(shape, "text"):
+                continue
+
+            text = shape.text.strip()
+
+            if not text:
+                continue
+
+            try:
+
+                if (
+                    shape.is_placeholder
+                    and shape.placeholder_format.type == 1
+                ):
+                    title = text
+                    break
+
+            except Exception:
+                pass
+
+        # ----------------------------------------------------
+        # Extract all slide content
+        # ----------------------------------------------------
+
+        for shape in slide.shapes:
+
+            try:
+
+                extracted = extract_shape_text(shape)
+
+                for item in extracted:
+
+                    if item:
+                        slide_text_parts.append(item)
+
+            except Exception as shape_error:
+
+                logger.warning(
+                    "Slide %d shape extraction failed: %s",
+                    slide_number,
+                    str(shape_error)
+                )
+
+        # Remove duplicate text while preserving order
+        cleaned_parts = []
+
+        for item in slide_text_parts:
+
+            if item not in cleaned_parts:
+                cleaned_parts.append(item)
+
+        slide_text = "\n".join(cleaned_parts).strip()
+
+        total_characters += len(slide_text)
+
+        slides_output.append(
+            {
+                "slide_number": slide_number,
+                "title": title,
+                "text": slide_text
+            }
         )
 
-        return {
-            "success": True,
-            "filename": "uploaded.pptx",
-            "slide_count": len(slides),
-            "slides": slides
-        }
+    return {
+        "success": True,
+        "file_type": "PPTX",
+        "slide_count": len(slides_output),
+        "total_characters": total_characters,
+        "slides": slides_output
+    }
 
-    except HTTPException:
-        raise
+
+# ============================================================
+# FILE EXTRACTION HELPER
+# ============================================================
+
+async def get_request_file(
+    request: Request,
+    file: Optional[UploadFile]
+):
+
+    # --------------------------------------------------------
+    # Case 1:
+    # Multipart upload
+    # --------------------------------------------------------
+
+    if file is not None:
+
+        logger.info(
+            "Multipart file received: %s",
+            file.filename
+        )
+
+        data = await file.read()
+
+        logger.info(
+            "Multipart file bytes: %d",
+            len(data)
+        )
+
+        return data
+
+    # --------------------------------------------------------
+    # Case 2:
+    # Raw binary upload
+    #
+    # THIS IS THE FORMAT CURRENT POWER AUTOMATE IS SENDING
+    # --------------------------------------------------------
+
+    data = await request.body()
+
+    content_type = request.headers.get(
+        "content-type",
+        ""
+    )
+
+    logger.info(
+        "Raw request received | content-type=%s | bytes=%d",
+        content_type,
+        len(data)
+    )
+
+    if data:
+
+        logger.info(
+            "First 16 bytes: %s",
+            data[:16].hex()
+        )
+
+    return data
+
+
+# ============================================================
+# MAIN EXTRACT ENDPOINT
+# ============================================================
+
+@app.post("/extract")
+async def extract_ppt(
+    request: Request,
+    file: Optional[UploadFile] = File(None)
+):
+
+    logger.info("=" * 70)
+    logger.info("RTSM PPT EXTRACT REQUEST STARTED")
+    logger.info("=" * 70)
+
+    try:
+
+        content_type = request.headers.get(
+            "content-type",
+            ""
+        )
+
+        content_length = request.headers.get(
+            "content-length",
+            "unknown"
+        )
+
+        logger.info(
+            "Content-Type: %s",
+            content_type
+        )
+
+        logger.info(
+            "Content-Length: %s",
+            content_length
+        )
+
+        # ----------------------------------------------------
+        # Get actual PPTX bytes
+        # ----------------------------------------------------
+
+        data = await get_request_file(
+            request=request,
+            file=file
+        )
+
+        # ----------------------------------------------------
+        # Validate
+        # ----------------------------------------------------
+
+        validate_pptx(data)
+
+        # ----------------------------------------------------
+        # Extract
+        # ----------------------------------------------------
+
+        logger.info(
+            "Starting PPTX extraction..."
+        )
+
+        result = extract_presentation(data)
+
+        logger.info(
+            "Extraction completed successfully."
+        )
+
+        logger.info(
+            "Slides extracted: %d",
+            result["slide_count"]
+        )
+
+        logger.info(
+            "Characters extracted: %d",
+            result["total_characters"]
+        )
+
+        logger.info("=" * 70)
+        logger.info("RTSM PPT EXTRACT REQUEST COMPLETED")
+        logger.info("=" * 70)
+
+        return JSONResponse(
+            status_code=200,
+            content=result
+        )
+
+    except ValueError as e:
+
+        logger.error(
+            "VALIDATION ERROR: %s",
+            str(e)
+        )
+
+        return JSONResponse(
+            status_code=400,
+            content={
+                "success": False,
+                "error_type": "ValidationError",
+                "message": str(e)
+            }
+        )
+
+    except zipfile.BadZipFile as e:
+
+        logger.error(
+            "BAD PPTX ZIP: %s",
+            str(e)
+        )
+
+        return JSONResponse(
+            status_code=400,
+            content={
+                "success": False,
+                "error_type": "InvalidPPTX",
+                "message": "The uploaded file is not a valid PPTX."
+            }
+        )
 
     except Exception as e:
-        logger.exception("PPTX extraction failed")
 
-        # Return the actual exception to Power Automate instead of hiding it
-        # behind a generic 500. This makes the next failure diagnosable.
-        raise HTTPException(
+        logger.exception(
+            "UNEXPECTED EXTRACTION ERROR"
+        )
+
+        return JSONResponse(
             status_code=500,
-            detail={
-                "error": "PPTX extraction failed",
-                "message": str(e),
-                "content_type": content_type,
-                "received_bytes": len(raw_body)
+            content={
+                "success": False,
+                "error_type": "InternalServerError",
+                "message": str(e)
             }
         )
 
 
-if __name__ == "__main__":
-    import uvicorn
+# ============================================================
+# OPTIONAL DEBUG ENDPOINT
+# ============================================================
 
-    port = int(os.environ.get("PORT", "10000"))
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=port
-    )
+@app.get("/status")
+async def status():
+
+    return {
+        "service": "tata-rtsm-ppt-extractor",
+        "status": "running",
+        "version": "2.0",
+        "extract_endpoint": "/extract"
+    }
